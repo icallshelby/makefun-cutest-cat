@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""make.fun cutest-cat-01 entry, v3: "Mochi", a chibi kitten waving.
+"""make.fun cutest-cat-01 entry, v4: "Mochi", a chibi kitten waving.
 
 Pure Python 3 standard library (no PIL, no numpy, no network, no
 assets). A round-faced cream-ginger kitten with a huge fluffy head,
 deep jewel-teal eyes with limbal rings and triple sparkles, an open
-happy mouth with one tiny fang, a bell collar, one paw raised in a
+happy mouth with two tiny fangs, a bell collar, one paw raised in a
 wave (toe beans to the viewer) and the other resting on its yarn
-ball -- rendered from signed-distance shapes with analytic
-anti-aliasing and layered radial shading, then written as a
-byte-for-byte deterministic PNG to /output/entry.png (or
-$MAKEFUN_OUTPUT_DIR/entry.png when that is set).
+ball, sitting on a plump cushion -- rendered from signed-distance
+shapes with analytic anti-aliasing and layered radial shading, then
+written as a byte-for-byte deterministic PNG to /output/entry.png
+(or $MAKEFUN_OUTPUT_DIR/entry.png when that is set).
 
 Every shape paints only inside its own tight bounding box, so the
 whole picture costs a few seconds on one CPU.
@@ -313,11 +313,16 @@ def draw():
         glow_spot(pic, (bx - br * 2, by - br * 2, bx + br * 2, by + br * 2),
                   bx, by, br, br, tint, al, 1.0)
 
+    # warm window light pooling in from the upper left corner
+    glow_spot(pic, (0, 0, 560, 520), 40, 30, 330, 300,
+              (255, 252, 238), 0.20, 1.3)
+
     # sparkles drifting in the corners
     for (sx, sy, sr, tint, al) in (
         (206, 118, 17, WHITE, 0.9), (872, 342, 13, ROSE_SOFT, 0.75),
         (112, 548, 11, ROSE_SOFT, 0.7), (934, 762, 12, WHITE, 0.8),
-        (660, 84, 10, WHITE, 0.7),
+        (660, 84, 10, WHITE, 0.7), (158, 372, 10, WHITE, 0.85),
+        (318, 330, 8, ROSE_SOFT, 0.7),
     ):
         pts = sparkle_pts(sx, sy, sr)
         pic.shape(bounds(pts, 3),
@@ -340,6 +345,27 @@ def draw():
     pic.shape((196, 812, 828, 956), rug_sdf, (243, 178, 164))
     pic.shape((206, 820, 818, 948),
               lambda x, y: dst_oval(x, y, 512, 884, 238, 38), (250, 198, 182))
+
+    # a plump cushion the kitten sits on: a fat squashed oval with a
+    # lighter top face and a soft shadow pooling underneath it
+    glow_spot(pic, (170, 846, 854, 972), 512, 916, 330, 42,
+              (216, 138, 104), 0.34, 1.25)
+
+    def cushion_fn(x, y):
+        d = dst_oval(x, y, 512, 884, 292, 54)
+        if d >= 0.8:
+            return None
+        t = clamp01((y - 838) / 92.0)
+        col = blend((252, 196, 178), (240, 152, 130), t)
+        dl = DIST(x - 420, y - 856) / 260.0
+        if dl < 1.0:
+            col = blend(col, (255, 226, 208), 0.5 * (1.0 - dl) ** 2)
+        return (col, cover(d))
+    pic.shade((212, 822, 812, 946), cushion_fn)
+    # two little tuft buttons dimpled into the cushion front
+    for bx2 in (392, 632):
+        glow_spot(pic, (bx2 - 26, 884, bx2 + 26, 928), bx2, 906, 13, 8,
+                  (228, 138, 116), 0.35, 1.0)
 
     # faint paw prints wandering across the corners of the floor
     for (pxx, pyy, ang) in ((128, 928, -0.4), (196, 958, 0.2),
@@ -370,6 +396,9 @@ def draw():
                   lambda x, y, s=seg: dst_path(x, y, s) - 37, FUR_TABBY)
     tip = tail[-7:]
     pic.shape(bounds(tip, 50), lambda x, y: dst_path(x, y, tip) - 36, CREAM)
+    # soften the seam where the cream tip meets the ginger
+    glow_spot(pic, bounds(tip, 56), tail[-7][0], tail[-7][1], 44, 44,
+              FUR, 0.38, 1.0)
 
     # ------------------------------------------------------------- body
     # a small plump body: the head is the star, the body just a base
@@ -388,12 +417,21 @@ def draw():
         scy = 788 + 124 * math.sin(ang)
         pic.shape((int(scx - 30), int(scy - 30), int(scx + 30), int(scy + 30)),
                   lambda x, y, a=scx, b=scy: dst_disc(x, y, a, b, 27), CREAM)
+    # a soft shadow pooled under the chin, grounding the big head
+    glow_spot(pic, (330, 606, 694, 700), 512, 650, 168, 30,
+              (219, 146, 92), 0.30, 1.25)
     # haunches flanking the base
     for hcx in (356, 668):
         pic.shape((hcx - 106, 716, hcx + 106, 912),
                   lambda x, y, c=hcx: dst_oval(x, y, c, 816, 98, 88), FUR_LO)
         pic.shape((hcx - 98, 724, hcx + 98, 904),
                   lambda x, y, c=hcx: dst_oval(x, y, c, 812, 90, 80), FUR)
+    # little toe ticks curving over the front of each foot
+    for hcx in (356, 668):
+        for off in (-27, 3):
+            pts = quad((hcx + off, 852), (hcx + off + 2, 868),
+                       (hcx + off + 5, 882), 10)
+            taper_stroke(pic.shape, pts, FUR_LO, 2.8)
 
     # ------------------------------------------------------- collar+bell
     # a shallow rose band hugging the neck under the chin, and a gold
@@ -578,7 +616,7 @@ def draw():
             # crescent of light pooled at the bottom of the iris
             dl = DIST(x - c, y - 492) / 60.0
             if dl < 1.0:
-                col = blend(col, WHITE, 0.16 * (1.0 - dl) ** 2)
+                col = blend(col, WHITE, 0.21 * (1.0 - dl) ** 2)
             return (col, cover(d))
         head_shade(ebox, iris_fn)
 
@@ -623,13 +661,17 @@ def draw():
     # philtrum down to an open, happy little mouth with one fang
     stem = [(512, 524), (512, 538)]
     head_shape(bounds(stem, 7), lambda x, y: dst_path(x, y, stem) - 4.4, LINE)
-    head_shape((482, 530, 542, 582),
-               lambda x, y: dst_oval(x, y, 512, 556, 23, 19), MOUTH_IN)
-    head_shape((488, 548, 536, 580),
-               lambda x, y: dst_oval(x, y, 512, 565, 16, 11), TONGUE)
-    fang = [(492, 540), (504, 540), (497, 554)]
+    head_shape((478, 530, 546, 590),
+               lambda x, y: dst_oval(x, y, 512, 558, 27, 22), MOUTH_IN)
+    head_shape((486, 550, 538, 586),
+               lambda x, y: dst_oval(x, y, 512, 570, 19, 13), TONGUE)
+    fang = [(488, 542), (506, 542), (496, 562)]
     head_shape(bounds(fang, 4), lambda x, y: dst_tri(x, y, *fang[0], *fang[1],
                                                      *fang[2]), WHITE)
+    fang2 = [(520, 542), (534, 542), (528, 556)]
+    head_shape(bounds(fang2, 4), lambda x, y: dst_tri(x, y, *fang2[0],
+                                                      *fang2[1], *fang2[2]),
+               WHITE)
 
     # -------------------------------------------------------------- blush
     # big soft blush low on both cheeks, with tiny anime cheek marks
@@ -638,7 +680,7 @@ def draw():
             u = ((x - c) / 56.0) ** 2 + ((y - 522) / 30.0) ** 2
             if u >= 1.0:
                 return None
-            return (BLUSH, 0.48 * (1.0 - u) ** 1.5)
+            return (BLUSH, 0.54 * (1.0 - u) ** 1.5)
         head_shade((bcx - 74, 480, bcx + 74, 564), blush_fn)
         for k in range(3):
             mx = bcx - 18 + 18 * k
@@ -654,13 +696,29 @@ def draw():
             pts = quad((HX + sgn * 104, wy), (HX + sgn * 204, wy + drop * 0.3),
                        (HX + sgn * 298, wy + drop), 22)
             taper_stroke(head_shape, pts, WHISK, 2.6)
+    # tiny whisker pores dotted on the muzzle
+    for sgn in (-1, 1):
+        for (dx, dy) in ((64, 506), (82, 518), (66, 528)):
+            head_shape((HX + sgn * dx - 5, dy - 5, HX + sgn * dx + 5, dy + 5),
+                       lambda x, y, a=HX + sgn * dx, b=dy:
+                       dst_disc(x, y, a, b, 2.3), (196, 138, 92))
 
     # -------------------------------------------------------- raised paw
     # the waving paw, drawn over the cheek fluff on the viewer's
     # left: a plump arm rising from the body, beans to the viewer
-    arm = cubic((348, 722), (292, 648), (252, 580), (238, 540), 22)
+    arm = cubic((348, 722), (302, 650), (250, 582), (238, 540), 22)
     pic.shape(bounds(arm, 52), lambda x, y: dst_path(x, y, arm) - 40, FUR_LO)
     pic.shape(bounds(arm, 52), lambda x, y: dst_path(x, y, arm) - 33, FUR)
+    # a soft light running along the arm's upper edge, plush-style
+    arm_hl = cubic((340, 718), (292, 646), (242, 578), (230, 540), 22)
+
+    def arm_light(x, y):
+        d = dst_path(x, y, arm_hl)
+        if d >= 16.0:
+            return None
+        a = 0.30 * (1.0 - d / 16.0) ** 1.5
+        return (FUR_HI, a) if a > 0.004 else None
+    pic.shade(bounds(arm_hl, 20), arm_light)
     PAW = (232, 478)
     paw_rot = -0.25
     ca, sa = math.cos(paw_rot), math.sin(paw_rot)
@@ -715,16 +773,25 @@ def draw():
         for t in (t1, t2):
             bow_shape(bow_box, lambda x, y, tt=scaled(t, bx, by + 14, 0.78):
                       dst_tri(x, y, *tt[0], *tt[1], *tt[2]), BOW)
+    # rounded plump loops: tilted ovals instead of stiff triangles
+    def loop_sdf(x, y, s, grow=0.0):
+        cx, cy = bx + s * 55, by - 2
+        dx, dy = x - cx, y - cy
+        ca2 = math.cos(s * 0.38)
+        sa2 = math.sin(s * 0.38)
+        lx = cx + dx * ca2 + dy * sa2
+        ly = cy - dx * sa2 + dy * ca2
+        return dst_oval(lx, ly, cx, cy, 52 + grow, 33 + grow)
+
     for sgn in (-1, 1):
-        loop = [(bx, by), (bx + sgn * 96, by - 48), (bx + sgn * 92, by + 50)]
-        bow_shape(bow_box, lambda x, y, t=loop:
-                  dst_tri(x, y, *t[0], *t[1], *t[2]), BOW_LO)
-        bow_shape(bow_box, lambda x, y, t=scaled(loop, bx, by, 0.86):
-                  dst_tri(x, y, *t[0], *t[1], *t[2]), BOW)
-        inner = [(bx + sgn * 16, by), (bx + sgn * 66, by - 26),
-                 (bx + sgn * 62, by + 28)]
-        bow_shape(bow_box, lambda x, y, t=inner:
-                  dst_tri(x, y, *t[0], *t[1], *t[2]), BOW_HI)
+        bow_shape(bow_box, lambda x, y, s=sgn: loop_sdf(x, y, s), BOW_LO)
+        bow_shape(bow_box, lambda x, y, s=sgn: loop_sdf(x, y, s) + 5, BOW)
+        # a soft sheen pooling on the loop's upper face
+        bow_shape(bow_box, lambda x, y, s=sgn:
+                  dst_oval(x, y, bx + s * 57, by - 13, 27, 13), BOW_HI)
+        # a fold shadow pinching the loop where it meets the knot
+        bow_shape(bow_box, lambda x, y, s=sgn:
+                  dst_oval(x, y, bx + s * 26, by + 8, 15, 22), BOW_LO)
     bow_shape(bow_box, lambda x, y: dst_disc(x, y, bx, by, 25), BOW_LO)
     bow_shape(bow_box, lambda x, y: dst_disc(x, y, bx, by, 19), BOW)
     bow_shape(bow_box, lambda x, y: dst_disc(x, y, bx - 6, by - 6, 6.5),
@@ -740,6 +807,7 @@ def draw():
         pad = int(s * 1.5)
         pic.shade((cx - pad, cy - pad, cx + pad, cy + pad), fn)
     heart(158, 262, 28, ROSE, 0.78)
+    heart(132, 448, 10, ROSE, 0.55)
     heart(880, 452, 20, ROSE, 0.62)
     heart(866, 190, 14, ROSE, 0.52)
     heart(104, 402, 13, ROSE, 0.5)
