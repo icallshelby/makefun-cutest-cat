@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
-"""make.fun cutest-cat-01 entry, v2: the cutest cat we can draw, in code.
+"""make.fun cutest-cat-01 entry, v3: "Mochi", a chibi kitten waving.
 
-Pure Python 3 standard library (no PIL, no numpy, no network).
-A soft storybook ginger kitten -- enormous sparkling eyes, a tilted
-head with fluffy cheeks, rosy falloff blush, tapered whiskers, toe
-beans, a pink bow and one paw resting on its ball of yarn -- built
-from signed-distance shapes with analytic anti-aliasing and gentle
-radial shading, then written as a deterministic PNG to
-/output/entry.png (or $MAKEFUN_OUTPUT_DIR/entry.png locally).
+Pure Python 3 standard library (no PIL, no numpy, no network, no
+assets). A round-faced cream-ginger kitten with a huge fluffy head,
+deep jewel-teal eyes with limbal rings and triple sparkles, an open
+happy mouth with one tiny fang, a bell collar, one paw raised in a
+wave (toe beans to the viewer) and the other resting on its yarn
+ball -- rendered from signed-distance shapes with analytic
+anti-aliasing and layered radial shading, then written as a
+byte-for-byte deterministic PNG to /output/entry.png (or
+$MAKEFUN_OUTPUT_DIR/entry.png when that is set).
 
-Every shape paints only inside its own tight bounding box, which
-keeps the whole render at a few seconds on one CPU.
+Every shape paints only inside its own tight bounding box, so the
+whole picture costs a few seconds on one CPU.
 
 Run:  python3 main.py
 """
@@ -20,603 +22,758 @@ import os
 import struct
 import zlib
 
-W = 1024
-H = 1024
-HYPOT = math.hypot
+SIZE = 1024
+DIST = math.hypot
+TAU = math.tau
 
 
-# ---------------------------------------------------------------- canvas
+# ------------------------------------------------------------------ image
 
-class Canvas:
-    """RGB bytearray canvas; shapes paint colour where their SDF <= 0."""
+class Pic:
+    """An RGB raster we blend shapes into, back to front."""
 
-    def __init__(self, w, h):
-        self.w = w
-        self.h = h
-        self.px = bytearray(w * h * 3)
+    def __init__(self, size):
+        self.size = size
+        self.buf = bytearray(size * size * 3)
 
-    def fill_fn(self, fn):
-        """Paint every pixel from fn(x, y) -> (color, alpha)."""
-        px, w, h = self.px, self.w, self.h
-        for y in range(h):
-            base = y * w * 3
-            for x in range(w):
-                color, a = fn(x, y)
-                if a >= 1.0:
-                    i = base + x * 3
-                    px[i] = color[0]
-                    px[i + 1] = color[1]
-                    px[i + 2] = color[2]
-                elif a > 0.0:
-                    i = base + x * 3
-                    ia = 1.0 - a
-                    px[i] = int(color[0] * a + px[i] * ia + 0.5)
-                    px[i + 1] = int(color[1] * a + px[i + 1] * ia + 0.5)
-                    px[i + 2] = int(color[2] * a + px[i + 2] * ia + 0.5)
+    def _put(self, i, rgb, a):
+        if a >= 1.0:
+            self.buf[i] = rgb[0]
+            self.buf[i + 1] = rgb[1]
+            self.buf[i + 2] = rgb[2]
+        elif a > 0.0:
+            b = self.buf
+            ia = 1.0 - a
+            b[i] = int(rgb[0] * a + b[i] * ia + 0.5)
+            b[i + 1] = int(rgb[1] * a + b[i + 1] * ia + 0.5)
+            b[i + 2] = int(rgb[2] * a + b[i + 2] * ia + 0.5)
 
-    def paint(self, bbox, dist_fn, color):
-        """dist_fn(x, y) <= 0 is inside; 1.5 px AA band on the edge."""
-        x0, y0, x1, y1 = bbox
-        x0 = max(0, x0); y0 = max(0, y0)
-        x1 = min(self.w - 1, x1); y1 = min(self.h - 1, y1)
-        px, w = self.px, self.w
-        cr, cg, cb = color
+    def wash(self, fn):
+        """Fill the whole raster from fn(x, y) -> (rgb, alpha)."""
+        s = self.size
+        for y in range(s):
+            row = y * s * 3
+            for x in range(s):
+                rgb, a = fn(x, y)
+                if a > 0.0:
+                    self._put(row + x * 3, rgb, a)
+
+    def shape(self, box, sdf, rgb):
+        """Solid fill: sdf(x, y) <= 0 inside, 1.6 px feathered edge."""
+        x0, y0, x1, y1 = self._clip(box)
+        s = self.size
         for y in range(y0, y1 + 1):
-            base = y * w * 3
+            row = y * s * 3
             for x in range(x0, x1 + 1):
-                d = dist_fn(x, y)
-                if d < 0.75:
-                    a = 1.0 if d <= -0.75 else (0.75 - d) / 1.5
-                    i = base + x * 3
-                    ia = 1.0 - a
-                    px[i] = int(cr * a + px[i] * ia + 0.5)
-                    px[i + 1] = int(cg * a + px[i + 1] * ia + 0.5)
-                    px[i + 2] = int(cb * a + px[i + 2] * ia + 0.5)
+                d = sdf(x, y)
+                if d < 0.8:
+                    a = 1.0 if d <= -0.8 else (0.8 - d) / 1.6
+                    self._put(row + x * 3, rgb, a)
 
-    def paint_fn(self, bbox, fn):
-        """fn(x, y) -> (color, alpha) or None, for shaded shapes."""
-        x0, y0, x1, y1 = bbox
-        x0 = max(0, x0); y0 = max(0, y0)
-        x1 = min(self.w - 1, x1); y1 = min(self.h - 1, y1)
-        px, w = self.px, self.w
+    def shade(self, box, fn):
+        """Per-pixel fill: fn(x, y) -> (rgb, alpha) or None."""
+        x0, y0, x1, y1 = self._clip(box)
+        s = self.size
         for y in range(y0, y1 + 1):
-            base = y * w * 3
+            row = y * s * 3
             for x in range(x0, x1 + 1):
                 out = fn(x, y)
-                if out is not None:
-                    color, a = out
-                    if a > 0.0:
-                        if a > 1.0:
-                            a = 1.0
-                        i = base + x * 3
-                        ia = 1.0 - a
-                        px[i] = int(color[0] * a + px[i] * ia + 0.5)
-                        px[i + 1] = int(color[1] * a + px[i + 1] * ia + 0.5)
-                        px[i + 2] = int(color[2] * a + px[i + 2] * ia + 0.5)
+                if out is not None and out[1] > 0.0:
+                    a = out[1] if out[1] < 1.0 else 1.0
+                    self._put(row + x * 3, out[0], a)
+
+    def _clip(self, box):
+        m = self.size - 1
+        return (max(0, box[0]), max(0, box[1]),
+                min(m, box[2]), min(m, box[3]))
 
 
-# ------------------------------------------------------- distance helpers
+# -------------------------------------------------------------- sdf toolbox
 
-def clamp(v, lo, hi):
-    return lo if v < lo else hi if v > hi else v
+def clamp01(v):
+    return 0.0 if v < 0.0 else 1.0 if v > 1.0 else v
 
 
-def sstep(a, b, v):
-    """Smoothstep between a and b."""
-    t = clamp((v - a) / (b - a), 0.0, 1.0)
+def smooth(a, b, v):
+    t = clamp01((v - a) / (b - a))
     return t * t * (3.0 - 2.0 * t)
 
 
-def mix(c1, c2, t):
+def blend(c1, c2, t):
     return (int(c1[0] + (c2[0] - c1[0]) * t + 0.5),
             int(c1[1] + (c2[1] - c1[1]) * t + 0.5),
             int(c1[2] + (c2[2] - c1[2]) * t + 0.5))
 
 
-def cov(d):
-    """Coverage from a signed distance (px): 1 deep inside, 0 outside."""
-    return clamp(0.75 - d, 0.0, 1.0)
+def cover(d):
+    """Alpha for a signed distance: solid deep inside, gone outside."""
+    return clamp01(0.8 - d)
 
 
-def d_circle(x, y, cx, cy, r):
-    return HYPOT(x - cx, y - cy) - r
+def dst_disc(x, y, cx, cy, r):
+    return DIST(x - cx, y - cy) - r
 
 
-def d_ellipse(x, y, cx, cy, rx, ry):
-    return (HYPOT((x - cx) / rx, (y - cy) / ry) - 1.0) * (rx if rx < ry else ry)
+def dst_oval(x, y, cx, cy, rx, ry):
+    return (DIST((x - cx) / rx, (y - cy) / ry) - 1.0) * min(rx, ry)
 
 
-def d_segment(x, y, ax, ay, bx, by):
-    px, py = x - ax, y - ay
-    dx, dy = bx - ax, by - ay
-    t = clamp((px * dx + py * dy) / (dx * dx + dy * dy), 0.0, 1.0)
-    return HYPOT(px - dx * t, py - dy * t)
+def dst_seg(x, y, ax, ay, bx, by):
+    ex, ey = bx - ax, by - ay
+    t = clamp01(((x - ax) * ex + (y - ay) * ey) / (ex * ex + ey * ey))
+    return DIST(x - ax - ex * t, y - ay - ey * t)
 
 
-def d_polyline(x, y, pts):
-    best = 1e18
+def dst_path(x, y, pts):
+    d = 1e18
     for i in range(len(pts) - 1):
-        d = d_segment(x, y, pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1])
-        if d < best:
-            best = d
-    return best
+        di = dst_seg(x, y, pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1])
+        if di < d:
+            d = di
+    return d
 
 
-def d_triangle(x, y, ax, ay, bx, by, cx, cy):
-    def edge(px, py, qx, qy, rx, ry):
+def dst_tri(x, y, ax, ay, bx, by, cx, cy):
+    def cross(px, py, qx, qy, rx, ry):
         return (qx - px) * (ry - py) - (qy - py) * (rx - px)
-    s1 = edge(ax, ay, bx, by, x, y)
-    s2 = edge(bx, by, cx, cy, x, y)
-    s3 = edge(cx, cy, ax, ay, x, y)
-    inside = (s1 >= 0 and s2 >= 0 and s3 >= 0) or (s1 <= 0 and s2 <= 0 and s3 <= 0)
-    d = min(
-        d_segment(x, y, ax, ay, bx, by),
-        d_segment(x, y, bx, by, cx, cy),
-        d_segment(x, y, cx, cy, ax, ay),
-    )
+    s1 = cross(ax, ay, bx, by, x, y)
+    s2 = cross(bx, by, cx, cy, x, y)
+    s3 = cross(cx, cy, ax, ay, x, y)
+    inside = (s1 >= 0 and s2 >= 0 and s3 >= 0) or \
+             (s1 <= 0 and s2 <= 0 and s3 <= 0)
+    d = min(dst_seg(x, y, ax, ay, bx, by),
+            dst_seg(x, y, bx, by, cx, cy),
+            dst_seg(x, y, cx, cy, ax, ay))
     return -d if inside else d
 
 
-def arc_pts(cx, cy, r, a0, a1, n=24):
-    return [
-        (cx + r * math.cos(a0 + (a1 - a0) * i / n),
-         cy + r * math.sin(a0 + (a1 - a0) * i / n))
-        for i in range(n + 1)
-    ]
+def arc(cx, cy, r, a0, a1, n=26):
+    return [(cx + r * math.cos(a0 + (a1 - a0) * i / n),
+             cy + r * math.sin(a0 + (a1 - a0) * i / n))
+            for i in range(n + 1)]
 
 
-def bezier_pts(p0, p1, p2, p3, n=24):
-    pts = []
+def cubic(p0, p1, p2, p3, n=26):
+    out = []
     for i in range(n + 1):
         t = i / n
-        u = 1 - t
-        x = u**3 * p0[0] + 3 * u * u * t * p1[0] + 3 * u * t * t * p2[0] + t**3 * p3[0]
-        y = u**3 * p0[1] + 3 * u * u * t * p1[1] + 3 * u * t * t * p2[1] + t**3 * p3[1]
-        pts.append((x, y))
-    return pts
+        u = 1.0 - t
+        out.append((u * u * u * p0[0] + 3 * u * u * t * p1[0]
+                    + 3 * u * t * t * p2[0] + t * t * t * p3[0],
+                    u * u * u * p0[1] + 3 * u * u * t * p1[1]
+                    + 3 * u * t * t * p2[1] + t * t * t * p3[1]))
+    return out
 
 
-def quad_pts(p0, p1, p2, n=20):
-    pts = []
+def quad(p0, p1, p2, n=22):
+    out = []
     for i in range(n + 1):
         t = i / n
-        u = 1 - t
-        pts.append((u * u * p0[0] + 2 * u * t * p1[0] + t * t * p2[0],
+        u = 1.0 - t
+        out.append((u * u * p0[0] + 2 * u * t * p1[0] + t * t * p2[0],
                     u * u * p0[1] + 2 * u * t * p1[1] + t * t * p2[1]))
-    return pts
+    return out
 
 
-def bbox_of(pts, pad):
+def bounds(pts, pad):
     xs = [p[0] for p in pts]
     ys = [p[1] for p in pts]
     return (int(min(xs) - pad), int(min(ys) - pad),
             int(max(xs) + pad), int(max(ys) + pad))
 
 
-def shrink(pts, cx, cy, f):
+def scaled(pts, cx, cy, f):
     return [(cx + (x - cx) * f, cy + (y - cy) * f) for (x, y) in pts]
 
 
-def star_pts(cx, cy, r):
-    """A soft four-point sparkle outline."""
+def sparkle_pts(cx, cy, r):
     pts = []
     for i in range(8):
-        ang = math.pi * i / 4
-        rad = r if i % 2 == 0 else r * 0.30
+        ang = math.pi * i / 4.0
+        rad = r if i % 2 == 0 else r * 0.28
         pts.append((cx + rad * math.cos(ang), cy + rad * math.sin(ang)))
     return pts
 
 
-# ---------------------------------------------------------------- palette
+# ----------------------------------------------------------------- palette
 
-BG_TOP = (255, 243, 231)
-BG_BOT = (255, 205, 186)
-GLOW = (255, 253, 246)
-FUR = (247, 170, 94)           # warm ginger
-FUR_LIGHT = (253, 201, 134)    # sunlit fur for highlights
-FUR_DARK = (231, 141, 65)      # soft rim of the fur shapes
-FUR_DEEP = (201, 113, 43)      # tabby stripes
-BELLY = (255, 242, 222)
-MUZZLE = (255, 247, 235)
-PINK = (244, 114, 152)
-PINK_SOFT = (252, 183, 203)
-NOSE = (240, 98, 128)
-BLUSH = (251, 148, 156)
-LINE = (110, 70, 44)           # mouth line
-WHISKER = (133, 94, 62)
-IRIS_LT = (150, 236, 210)
-IRIS_MID = (66, 199, 168)
-IRIS_DEEP = (24, 132, 116)
-EYE_DARK = (24, 22, 26)
+PAPER_HI = (255, 247, 236)
+PAPER_LO = (255, 206, 184)
+HALO = (255, 253, 244)
+FUR = (246, 166, 92)            # ginger coat
+FUR_HI = (255, 207, 142)        # sunlit coat
+FUR_LO = (230, 136, 60)         # coat shadow / outline pass
+FUR_TABBY = (196, 108, 42)      # stripes
+CREAM = (255, 243, 224)         # bib, muzzle, ear fluff
+MUZZLE = (255, 248, 238)
+ROSE = (244, 114, 152)
+ROSE_SOFT = (252, 183, 203)
+NOSE = (238, 95, 124)
+BLUSH = (250, 140, 150)
+MOUTH_IN = (146, 54, 74)
+TONGUE = (247, 130, 158)
+LINE = (104, 64, 40)
+WHISK = (128, 90, 60)
+IRIS_TOP = (16, 112, 104)
+IRIS_MID = (46, 196, 166)
+IRIS_LOW = (168, 244, 214)
+IRIS_RIM = (8, 84, 76)
+PUPIL = (22, 20, 24)
 WHITE = (255, 255, 255)
-YARN = (240, 110, 150)
-YARN_DARK = (203, 70, 114)
-BOW = (238, 82, 128)
-BOW_DARK = (203, 52, 100)
-GRASS = (146, 201, 138)
-GRASS_DARK = (116, 182, 116)
+COLLAR = (226, 70, 116)
+COLLAR_HI = (244, 120, 158)
+BELL = (250, 198, 88)
+BELL_LO = (219, 148, 42)
+BELL_HI = (255, 236, 168)
+YARN = (238, 106, 148)
+YARN_LO = (200, 66, 110)
+BOW = (240, 84, 130)
+BOW_LO = (198, 48, 98)
+BOW_HI = (252, 150, 182)
 
 
-# ------------------------------------------------------------ soft helpers
+# ------------------------------------------------------------ soft painting
 
-def soft_ellipse(cv, bbox, cx, cy, rx, ry, color, max_alpha, grow=1.2):
-    """An ellipse filled with a radial falloff: full alpha at the
-    centre, fading to nothing at a slightly grown ellipse boundary,
-    so it can never clip against its own bounding box."""
-    grx, gry = rx * grow, ry * grow
+def glow_spot(pic, box, cx, cy, rx, ry, rgb, peak, grow=1.25):
+    """A radial-falloff ellipse: full strength at the middle, easing
+    to nothing before a slightly enlarged boundary, so it can never
+    clip against its own box."""
+    gx, gy = rx * grow, ry * grow
 
     def fn(x, y):
-        u = ((x - cx) / grx) ** 2 + ((y - cy) / gry) ** 2
+        u = ((x - cx) / gx) ** 2 + ((y - cy) / gy) ** 2
         if u >= 1.0:
             return None
-        return (color, max_alpha * (1.0 - u) ** 1.5)
-    cv.paint_fn(bbox, fn)
+        return (rgb, peak * (1.0 - u) ** 1.6)
+    pic.shade(box, fn)
 
 
-def fur_shade(cv, bbox, cx, cy, rx, ry, paint_fn):
-    """Gentle radial shading over a fur ellipse: a sunlit blush toward
-    the upper left and a soft deep rim, so flat shapes feel plush.
-    paint_fn is cv.paint_fn or a head-space wrapper with same signature."""
-    def highlight(x, y):
-        d = d_ellipse(x, y, cx, cy, rx, ry)
-        if d >= 0.75:
+def coat_shading(pic, box, sdf, cx, cy, rx, ry):
+    """Plush shading over a fur silhouette given by sdf: a warm light
+    blooming from the upper left and a soft shadow rim that follows
+    the silhouette's own edge."""
+    def light(x, y):
+        if sdf(x, y) >= 0.8:
             return None
-        lx, ly = cx - rx * 0.40, cy - ry * 0.44
-        dl = HYPOT(x - lx, y - ly) / (rx * 1.25)
-        a = 0.34 * max(0.0, 1.0 - dl) ** 2
-        return (FUR_LIGHT, a) if a > 0.004 else None
+        d = DIST(x - (cx - rx * 0.38), y - (cy - ry * 0.46)) / (rx * 1.3)
+        a = 0.32 * max(0.0, 1.0 - d) ** 2
+        return (FUR_HI, a) if a > 0.004 else None
 
     def rim(x, y):
-        d = d_ellipse(x, y, cx, cy, rx, ry)
-        if d >= 0.75:
+        d = sdf(x, y)
+        if d >= 0.8 or d < -46.0:
             return None
-        u = ((x - cx) / rx) ** 2 + ((y - cy) / ry) ** 2
-        a = 0.15 * sstep(0.52, 1.0, u)
-        return (FUR_DEEP, a) if a > 0.004 else None
+        a = 0.16 * smooth(-46.0, 0.0, d)
+        return (FUR_TABBY, a) if a > 0.004 else None
 
-    paint_fn(bbox, highlight)
-    paint_fn(bbox, rim)
+    pic.shade(box, light)
+    pic.shade(box, rim)
 
 
-def tapered_line(paint, pts, color, r0=3.4):
-    """Paint a polyline in three chunks with shrinking radius, so the
-    stroke tapers like a real whisker. paint(bbox, dist_fn, color)."""
+def taper_stroke(paint, pts, rgb, r0):
+    """Stroke a path in three runs of shrinking radius so it tapers
+    like a whisker. paint(box, sdf, rgb) is Pic.shape or a wrapper."""
     n = len(pts)
-    cuts = ((0, n // 3 + 1, r0), (n // 3, 2 * n // 3 + 1, r0 * 0.72),
-            (2 * n // 3, n, r0 * 0.48))
-    for (i0, i1, r) in cuts:
+    for (i0, i1, f) in ((0, n // 3 + 1, 1.0), (n // 3, 2 * n // 3 + 1, 0.7),
+                        (2 * n // 3, n, 0.45)):
         seg = pts[i0:i1]
         if len(seg) < 2:
             continue
-        paint(bbox_of(seg, int(r) + 3),
-              lambda x, y, s=seg, rr=r: d_polyline(x, y, s) - rr, color)
+        r = r0 * f
+        paint(bounds(seg, int(r) + 3),
+              lambda x, y, s=seg, rr=r: dst_path(x, y, s) - rr, rgb)
 
 
-# ---------------------------------------------------------------- drawing
+# ------------------------------------------------------------------- scene
 
 def draw():
-    cv = Canvas(W, H)
+    pic = Pic(SIZE)
 
-    # ------------------------------------------------------ background
-    # warm gradient plus a soft radial glow behind the kitten
-    def bg_fn(x, y):
-        base = mix(BG_TOP, BG_BOT, y / (H - 1))
-        dl = HYPOT(x - 512, y - 420) / 600.0
-        g = max(0.0, 1.0 - dl) ** 2
-        if g > 0.003:
-            base = mix(base, GLOW, 0.5 * g)
+    # -------------------------------------------------------- backdrop
+    # warm paper gradient, a halo behind the kitten, a gentle
+    # deepening toward the corners, and quiet bokeh floating over it
+    def backdrop_fn(x, y):
+        base = blend(PAPER_HI, PAPER_LO, y / (SIZE - 1))
+        halo = max(0.0, 1.0 - DIST(x - 512, y - 400) / 620.0) ** 2
+        if halo > 0.003:
+            base = blend(base, HALO, 0.55 * halo)
+        edge = DIST(x - 512, y - 470) / 760.0
+        if edge > 0.62:
+            base = blend(base, (250, 188, 168), 0.35 * (edge - 0.62) / 0.38)
         return (base, 1.0)
-    cv.fill_fn(bg_fn)
+    pic.wash(backdrop_fn)
 
-    # tiny sparkles and dots floating in the corners, kept subtle
-    for (sx, sy, sr, col, al) in (
-        (146, 128, 15, WHITE, 0.85), (884, 116, 12, WHITE, 0.8),
-        (922, 470, 10, PINK_SOFT, 0.7), (104, 452, 9, PINK_SOFT, 0.65),
+    for (bx, by, br, tint, al) in (
+        (118, 292, 36, WHITE, 0.13), (922, 250, 46, WHITE, 0.11),
+        (846, 636, 27, ROSE_SOFT, 0.13), (148, 690, 23, WHITE, 0.10),
+        (66, 108, 19, ROSE_SOFT, 0.14), (962, 84, 25, WHITE, 0.12),
+        (566, 108, 15, WHITE, 0.09), (306, 168, 13, ROSE_SOFT, 0.10),
+        (716, 150, 11, WHITE, 0.08), (88, 470, 12, WHITE, 0.09),
     ):
-        pts = star_pts(sx, sy, sr)
-        cv.paint(bbox_of(pts, 3),
-                 lambda x, y, p=pts: d_polyline(x, y, p + [p[0]]) - 1.0, col)
-    for (dx, dy, dr, col) in ((196, 196, 6, PINK_SOFT), (838, 208, 5, WHITE),
-                              (120, 560, 5, WHITE), (916, 588, 6, PINK_SOFT)):
-        cv.paint((dx - dr - 2, dy - dr - 2, dx + dr + 2, dy + dr + 2),
-                 lambda x, y, a=dx, b=dy, r=dr: d_circle(x, y, a, b, r), col)
+        glow_spot(pic, (bx - br * 2, by - br * 2, bx + br * 2, by + br * 2),
+                  bx, by, br, br, tint, al, 1.0)
 
-    # ---------------------------------------------------- ground + rug
-    # one soft shadow and one soft mat, both radial-falloff ellipses
-    # whose bounding boxes fully contain the faded grown boundary
-    soft_ellipse(cv, (70, 796, 954, 936), 512, 866, 342, 46,
-                 (226, 158, 124), 0.5, 1.25)
-    soft_ellipse(cv, (130, 806, 894, 930), 512, 868, 316, 40,
-                 (250, 206, 176), 0.7, 1.15)
+    # sparkles drifting in the corners
+    for (sx, sy, sr, tint, al) in (
+        (206, 118, 17, WHITE, 0.9), (872, 342, 13, ROSE_SOFT, 0.75),
+        (112, 548, 11, ROSE_SOFT, 0.7), (934, 762, 12, WHITE, 0.8),
+        (660, 84, 10, WHITE, 0.7),
+    ):
+        pts = sparkle_pts(sx, sy, sr)
+        pic.shape(bounds(pts, 3),
+                  lambda x, y, p=pts: dst_path(x, y, p + [p[0]]) - 1.6, tint)
 
-    # small grass tufts in the bottom corners
-    for gx in (64, 96, 130, 880, 916, 950):
-        sway = 10 if gx % 3 == 0 else -6
-        blade = [(gx - 11, 1016), (gx + sway, 950 + (gx % 5) * 4), (gx + 11, 1016)]
-        cv.paint(bbox_of(blade, 3),
-                 lambda x, y, t=blade: d_triangle(x, y, *t[0], *t[1], *t[2]),
-                 GRASS if gx % 2 == 0 else GRASS_DARK)
+    # ------------------------------------------------------ floor + rug
+    glow_spot(pic, (60, 800, 964, 950), 512, 878, 352, 48,
+              (224, 152, 120), 0.50, 1.25)
+    # a scalloped round rug under the kitten: overlapping discs
+    rug_c = [(512 + 236 * math.cos(TAU * i / 14.0),
+              884 + 40 * math.sin(TAU * i / 14.0)) for i in range(14)]
 
-    # ---------------------------------------------------------- tail
-    # One tail curls from behind the body around the cat's right side
-    # (viewer's right) and lifts at the end with a cream tip.
-    tail_path = bezier_pts((640, 800), (836, 802), (884, 690), (838, 592), 30)
-    tail_bb = bbox_of(tail_path, 52)
-    cv.paint(tail_bb, lambda x, y: d_polyline(x, y, tail_path) - 40, FUR_DARK)
-    cv.paint(tail_bb, lambda x, y: d_polyline(x, y, tail_path) - 33, FUR)
-    for i in (14, 20):
-        a_pt = tail_path[i]
-        b_pt = tail_path[i + 1]
-        seg = [a_pt, ((a_pt[0] + b_pt[0]) / 2, (a_pt[1] + b_pt[1]) / 2)]
-        cv.paint(bbox_of(seg, 44), lambda x, y, s=seg: d_polyline(x, y, s) - 34, FUR_DEEP)
-    tip_path = tail_path[-7:]
-    cv.paint(bbox_of(tip_path, 45), lambda x, y: d_polyline(x, y, tip_path) - 33, BELLY)
+    def rug_sdf(x, y):
+        d = dst_oval(x, y, 512, 884, 252, 46)
+        for (cx, cy) in rug_c:
+            di = dst_disc(x, y, cx, cy, 23)
+            if di < d:
+                d = di
+        return d
+    pic.shape((196, 812, 828, 956), rug_sdf, (243, 178, 164))
+    pic.shape((206, 820, 818, 948),
+              lambda x, y: dst_oval(x, y, 512, 884, 238, 38), (250, 198, 182))
 
-    # --------------------------------------------------------------- body
-    BODY = (512, 722, 240, 196)
-    cv.paint((264, 516, 760, 910), lambda x, y: d_ellipse(x, y, *BODY), FUR_DARK)
-    cv.paint((272, 524, 752, 902), lambda x, y: d_ellipse(x, y, 512, 716, 230, 188), FUR)
-    fur_shade(cv, (280, 530, 744, 896), 512, 716, 230, 188, cv.paint_fn)
-    # belly patch with a scalloped fluffy top edge
-    cv.paint((356, 610, 668, 890), lambda x, y: d_ellipse(x, y, 512, 756, 148, 138), BELLY)
+    # faint paw prints wandering across the corners of the floor
+    for (pxx, pyy, ang) in ((128, 928, -0.4), (196, 958, 0.2),
+                            (884, 946, 0.5), (820, 972, -0.2)):
+        ca, sa = math.cos(ang), math.sin(ang)
+
+        def paw_sdf(x, y, a=ca, b=sa, cx=pxx, cy=pyy):
+            lx = cx + (x - cx) * a + (y - cy) * b
+            ly = cy - (x - cx) * b + (y - cy) * a
+            d = dst_oval(lx, ly, cx, cy + 6, 13, 10)
+            for (tx, ty) in ((-14, -8), (-5, -13), (5, -13), (14, -8)):
+                di = dst_disc(lx, ly, cx + tx, cy + ty, 5)
+                if di < d:
+                    d = di
+            return d
+        pic.shape((pxx - 30, pyy - 26, pxx + 30, pyy + 26), paw_sdf,
+                  (238, 172, 156))
+
+    # ------------------------------------------------------------- tail
+    # one plump tail sweeping out on the viewer's right, cream-tipped
+    tail = cubic((628, 806), (852, 812), (902, 690), (852, 576), 30)
+    tail_box = bounds(tail, 58)
+    pic.shape(tail_box, lambda x, y: dst_path(x, y, tail) - 44, FUR_LO)
+    pic.shape(tail_box, lambda x, y: dst_path(x, y, tail) - 36, FUR)
+    for i in (13, 19):
+        seg = [tail[i], tail[i + 1]]
+        pic.shape(bounds(seg, 46),
+                  lambda x, y, s=seg: dst_path(x, y, s) - 37, FUR_TABBY)
+    tip = tail[-7:]
+    pic.shape(bounds(tip, 50), lambda x, y: dst_path(x, y, tip) - 36, CREAM)
+
+    # ------------------------------------------------------------- body
+    # a small plump body: the head is the star, the body just a base
+    BODY = (512, 754, 208, 172)
+    body_sdf = lambda x, y: dst_oval(x, y, *BODY)
+    pic.shape((296, 574, 728, 934), body_sdf, FUR_LO)
+    pic.shape((304, 582, 720, 926),
+              lambda x, y: dst_oval(x, y, 512, 748, 198, 164), FUR)
+    coat_shading(pic, (310, 588, 714, 920), body_sdf, *BODY)
+    # cream bib with a fluffy scalloped top edge
+    pic.shape((372, 640, 652, 916),
+              lambda x, y: dst_oval(x, y, 512, 788, 132, 128), CREAM)
     for k in range(5):
-        ang = math.radians(180 + 36 * k + 18)
-        scx = 512 + 148 * math.cos(ang) * 0.96
-        scy = 756 + 138 * math.sin(ang) * 0.96
-        cv.paint((int(scx - 34), int(scy - 34), int(scx + 34), int(scy + 34)),
-                 lambda x, y, a=scx, b=scy: d_circle(x, y, a, b, 30), BELLY)
-    # haunches at the base, either side
-    for hcx in (348, 676):
-        cv.paint((hcx - 112, 702, hcx + 112, 898),
-                 lambda x, y, c=hcx: d_ellipse(x, y, c, 800, 104, 92), FUR_DARK)
-        cv.paint((hcx - 104, 710, hcx + 104, 890),
-                 lambda x, y, c=hcx: d_ellipse(x, y, c, 796, 96, 85), FUR)
+        ang = math.radians(196 + 32 * k)
+        scx = 512 + 128 * math.cos(ang)
+        scy = 788 + 124 * math.sin(ang)
+        pic.shape((int(scx - 30), int(scy - 30), int(scx + 30), int(scy + 30)),
+                  lambda x, y, a=scx, b=scy: dst_disc(x, y, a, b, 27), CREAM)
+    # haunches flanking the base
+    for hcx in (356, 668):
+        pic.shape((hcx - 106, 716, hcx + 106, 912),
+                  lambda x, y, c=hcx: dst_oval(x, y, c, 816, 98, 88), FUR_LO)
+        pic.shape((hcx - 98, 724, hcx + 98, 904),
+                  lambda x, y, c=hcx: dst_oval(x, y, c, 812, 90, 80), FUR)
 
-    # ---------------------------------------------------------- yarn ball
-    # the favourite toy, peeking out from under the cat's right paw
-    ycx, ycy, yr = 740, 860, 60
-    ybb = (ycx - yr - 8, ycy - yr - 8, ycx + yr + 8, ycy + yr + 8)
-    cv.paint(ybb, lambda x, y: d_circle(x, y, ycx, ycy, yr), YARN_DARK)
-    cv.paint(ybb, lambda x, y: d_circle(x, y, ycx, ycy, yr - 6), YARN)
+    # ------------------------------------------------------- collar+bell
+    # a shallow rose band hugging the neck under the chin, and a gold
+    # bell hanging at its centre onto the chest
+    collar_arc = arc(512, 468, 170, math.radians(60), math.radians(120), 30)
+    pic.shape(bounds(collar_arc, 22),
+              lambda x, y: dst_path(x, y, collar_arc) - 15, COLLAR)
+    collar_hi = arc(512, 468, 170, math.radians(70), math.radians(110), 22)
+    pic.shape(bounds(collar_hi, 16),
+              lambda x, y: dst_path(x, y, collar_hi) - 5, COLLAR_HI)
+
+    def bell_fn(x, y):
+        d = dst_disc(x, y, 512, 656, 29)
+        if d >= 0.8:
+            return None
+        t = clamp01((y - 630) / 54.0)
+        col = blend(BELL_HI, BELL, t)
+        dl = DIST(x - 501, y - 643) / 42.0
+        if dl < 1.0:
+            col = blend(col, (255, 248, 214), 0.55 * (1.0 - dl) ** 2)
+        return (col, cover(d))
+    pic.shade((476, 620, 548, 692), bell_fn)
+    band = [(488, 663), (536, 663)]
+    pic.shape(bounds(band, 8), lambda x, y: dst_path(x, y, band) - 3.2, BELL_LO)
+    pic.shape((504, 648, 520, 664), lambda x, y: dst_disc(x, y, 512, 656, 5.2),
+              BELL_LO)
+
+    # --------------------------------------------------------- yarn ball
+    # the favourite toy on the viewer's right, under the resting paw
+    ycx, ycy, yr = 748, 866, 58
+    ybox = (ycx - yr - 9, ycy - yr - 9, ycx + yr + 9, ycy + yr + 9)
+    pic.shape(ybox, lambda x, y: dst_disc(x, y, ycx, ycy, yr), YARN_LO)
+    pic.shape(ybox, lambda x, y: dst_disc(x, y, ycx, ycy, yr - 6), YARN)
     for pts in (
-        arc_pts(ycx, ycy, yr * 0.60, 3.4, 5.6),
-        arc_pts(ycx, ycy, yr * 0.78, 2.6, 4.4),
-        arc_pts(ycx, ycy, yr * 0.52, 0.4, 2.2),
-        bezier_pts((ycx - 46, ycy + 32), (ycx - 8, ycy + 52),
-                   (ycx + 28, ycy + 46), (ycx + 48, ycy + 14)),
+        arc(ycx, ycy, yr * 0.58, 3.3, 5.7),
+        arc(ycx, ycy, yr * 0.78, 2.5, 4.5),
+        arc(ycx, ycy, yr * 0.50, 0.3, 2.3),
+        cubic((ycx - 44, ycy + 30), (ycx - 6, ycy + 50),
+              (ycx + 26, ycy + 44), (ycx + 46, ycy + 12)),
     ):
-        cv.paint(bbox_of(pts, 9), lambda x, y, p=pts: d_polyline(x, y, p) - 5, YARN_DARK)
-    hl = arc_pts(ycx, ycy, yr * 0.86, 3.6, 4.6)
-    cv.paint(bbox_of(hl, 7), lambda x, y, p=hl: d_polyline(x, y, p) - 3.5, PINK_SOFT)
-    # loose strand curling away on the ground
-    strand = bezier_pts((782, 898), (830, 920), (868, 888), (892, 908), 20)
-    strand += bezier_pts((892, 908), (912, 922), (926, 900), (910, 884), 10)[1:]
-    cv.paint(bbox_of(strand, 9), lambda x, y: d_polyline(x, y, strand) - 5, YARN_DARK)
+        pic.shape(bounds(pts, 9), lambda x, y, p=pts: dst_path(x, y, p) - 5,
+                  YARN_LO)
+    hl = arc(ycx, ycy, yr * 0.85, 3.7, 4.7)
+    pic.shape(bounds(hl, 7), lambda x, y, p=hl: dst_path(x, y, p) - 3.4,
+              ROSE_SOFT)
+    strand = cubic((790, 900), (838, 924), (876, 888), (898, 910), 20)
+    strand += cubic((898, 910), (918, 926), (934, 900), (914, 884), 10)[1:]
+    pic.shape(bounds(strand, 9), lambda x, y: dst_path(x, y, strand) - 5,
+              YARN_LO)
 
-    # ---------------------------------------------------------- front paws
-    # two clumsy oversized front paws with pink toe beans; the right
-    # one rests on the yarn ball
-    for (pcx, pcy, prx, pry) in ((406, 860, 74, 40), (644, 832, 76, 42)):
-        pbb = (pcx - prx - 8, pcy - pry - 8, pcx + prx + 8, pcy + pry + 8)
-        cv.paint(pbb, lambda x, y, a=pcx, b=pcy, c=prx, d=pry:
-                 d_ellipse(x, y, a, b, c, d), FUR_DARK)
-        cv.paint(pbb, lambda x, y, a=pcx, b=pcy, c=prx - 7, d=pry - 7:
-                 d_ellipse(x, y, a, b, c, d), FUR)
-        # toe beans: three small pads in an arc over one big pad
-        for (tx, ty, trx, try_) in ((-30, -8, 11, 9), (0, -15, 12, 10),
-                                   (30, -8, 11, 9), (0, 14, 24, 16)):
-            cv.paint((pcx + tx - trx - 3, pcy + ty - try_ - 3,
-                      pcx + tx + trx + 3, pcy + ty + try_ + 3),
-                     lambda x, y, a=pcx + tx, b=pcy + ty, c=trx, d=try_:
-                     d_ellipse(x, y, a, b, c, d), PINK_SOFT)
+    # resting paw over the yarn (viewer right)
+    pcx, pcy = 660, 838
+    pic.shape((pcx - 84, pcy - 50, pcx + 84, pcy + 50),
+              lambda x, y: dst_oval(x, y, pcx, pcy, 76, 42), FUR_LO)
+    pic.shape((pcx - 77, pcy - 43, pcx + 77, pcy + 43),
+              lambda x, y: dst_oval(x, y, pcx, pcy, 69, 35), FUR)
+    for (tx, ty, trx, tryy) in ((-30, -6, 11, 9), (0, -13, 12, 10),
+                                (30, -6, 11, 9), (0, 15, 24, 16)):
+        pic.shape((pcx + tx - trx - 3, pcy + ty - tryy - 3,
+                   pcx + tx + trx + 3, pcy + ty + tryy + 3),
+                  lambda x, y, a=pcx + tx, b=pcy + ty, c=trx, d=tryy:
+                  dst_oval(x, y, a, b, c, d), ROSE_SOFT)
 
     # --------------------------------------------------------------- head
-    # Head group tilted ~7 degrees for charm: shapes are evaluated in
-    # head space; each carries its own tight head-space bbox, widened
-    # a little to cover the rotation.
-    HX, HY = 512, 402
-    TILT = math.radians(-7.0)
-    CT, ST = math.cos(TILT), math.sin(TILT)
+    # One big fluffy head, tipped five degrees for charm. Everything
+    # on the face is drawn in head space and mapped through the tip.
+    HX, HY = 512, 382
+    TIP = math.radians(-5.0)
+    CT, ST = math.cos(TIP), math.sin(TIP)
 
-    def head_paint(hbb, fn, color):
-        (x0, y0, x1, y1) = hbb
-        pad = int((abs(ST) * (x1 - x0 + y1 - y0)) / 2) + 6
-        def wrapped(x, y):
-            dx, dy = x - HX, y - HY
-            return fn(HX + dx * CT + dy * ST, HY - dx * ST + dy * CT)
-        cv.paint((x0 - pad, y0 - pad, x1 + pad, y1 + pad), wrapped, color)
+    def to_head(x, y):
+        dx, dy = x - HX, y - HY
+        return (HX + dx * CT + dy * ST, HY - dx * ST + dy * CT)
 
-    def head_fn(hbb, fn):
-        (x0, y0, x1, y1) = hbb
-        pad = int((abs(ST) * (x1 - x0 + y1 - y0)) / 2) + 6
-        def wrapped(x, y):
-            dx, dy = x - HX, y - HY
-            out = fn(HX + dx * CT + dy * ST, HY - dx * ST + dy * CT)
-            return out
-        cv.paint_fn((x0 - pad, y0 - pad, x1 + pad, y1 + pad), wrapped)
+    def head_shape(hbox, sdf, rgb):
+        x0, y0, x1, y1 = hbox
+        pad = int(abs(ST) * (x1 - x0 + y1 - y0) / 2) + 7
+        pic.shape((x0 - pad, y0 - pad, x1 + pad, y1 + pad),
+                  lambda x, y: sdf(*to_head(x, y)), rgb)
 
-    # ears: rounded triangles, fur inset, layered pink inner ear,
-    # and a little cream tuft at the base of each inner ear
-    for (ex, sgn) in ((356, -1), (668, 1)):
-        tri = [(ex - 96, 274), (ex + sgn * 30, 120), (ex + 96, 274)]
-        gx = sum(p[0] for p in tri) / 3
-        gy = sum(p[1] for p in tri) / 3
-        fur_tri = shrink(tri, gx, gy, 0.86)
-        in_tri = shrink(tri, gx, gy, 0.54)
-        in2_tri = shrink(tri, gx, gy, 0.34)
-        ebb = bbox_of(tri, 6)
-        head_paint(ebb, lambda x, y, t=tri: d_triangle(x, y, *t[0], *t[1], *t[2]), FUR_DARK)
-        head_paint(ebb, lambda x, y, t=fur_tri: d_triangle(x, y, *t[0], *t[1], *t[2]), FUR)
-        head_paint(ebb, lambda x, y, t=in_tri: d_triangle(x, y, *t[0], *t[1], *t[2]), PINK_SOFT)
-        head_paint(ebb, lambda x, y, t=in2_tri: d_triangle(x, y, *t[0], *t[1], *t[2]), (253, 208, 222))
-        tuft = [(gx - 20, gy + 44), (gx + 2, gy + 12), (gx + 22, gy + 44)]
-        head_paint(bbox_of(tuft, 4),
-                   lambda x, y, t=tuft: d_triangle(x, y, *t[0], *t[1], *t[2]), BELLY)
+    def head_shade(hbox, fn):
+        x0, y0, x1, y1 = hbox
+        pad = int(abs(ST) * (x1 - x0 + y1 - y0) / 2) + 7
+        pic.shade((x0 - pad, y0 - pad, x1 + pad, y1 + pad),
+                  lambda x, y: fn(*to_head(x, y)))
 
-    # gentle cheek scallops: small bumps sitting right on the head
-    # disc's edge, so the silhouette reads fluffy without sticking out
-    for fy in (486, 542):
-        dx = 242 * math.sqrt(max(0.0, 1.0 - ((fy - HY) / 218.0) ** 2))
-        for fx in (HX - dx + 8, HX + dx - 8):
-            fbb = (int(fx - 26), fy - 26, int(fx + 26), fy + 26)
-            head_paint(fbb, lambda x, y, a=fx, b=fy: d_circle(x, y, a, b, 20), FUR_DARK)
-            head_paint(fbb, lambda x, y, a=fx, b=fy: d_circle(x, y, a, b, 14), FUR)
+    # ears first, behind the head: broad triangles with a tuft spike,
+    # a rose inner ear and cream fluff zig-zagging out of it
+    for (ex, sgn) in ((338, -1), (686, 1)):
+        tri = [(ex - 92, 268), (ex + sgn * 16, 96), (ex + 104, 256)]
+        gx = sum(p[0] for p in tri) / 3.0
+        gy = sum(p[1] for p in tri) / 3.0
+        ebox = bounds(tri, 8)
+        head_shape(ebox, lambda x, y, t=tri: dst_tri(x, y, *t[0], *t[1], *t[2]),
+                   FUR_LO)
+        head_shape(ebox, lambda x, y, t=scaled(tri, gx, gy, 0.87):
+                   dst_tri(x, y, *t[0], *t[1], *t[2]), FUR)
+        head_shape(ebox, lambda x, y, t=scaled(tri, gx, gy, 0.58):
+                   dst_tri(x, y, *t[0], *t[1], *t[2]), ROSE_SOFT)
+        head_shape(ebox, lambda x, y, t=scaled(tri, gx, gy, 0.40):
+                   dst_tri(x, y, *t[0], *t[1], *t[2]), (253, 210, 224))
+        for k in range(3):
+            fx = gx - 26 + 26 * k
+            spike = [(fx - 11, gy + 52), (fx + 4, gy + 16), (fx + 15, gy + 52)]
+            head_shape(bounds(spike, 4),
+                       lambda x, y, t=spike: dst_tri(x, y, *t[0], *t[1], *t[2]),
+                       CREAM)
+        tip_tri = [(tri[1][0] - 7, tri[1][1] + 16), (tri[1][0] + sgn * 3,
+                    tri[1][1] - 16), (tri[1][0] + 13, tri[1][1] + 14)]
+        head_shape(bounds(tip_tri, 4),
+                   lambda x, y, t=tip_tri: dst_tri(x, y, *t[0], *t[1], *t[2]),
+                   FUR)
 
-    # head disc: big and round (kitten proportions), softly shaded
-    head_paint((262, 176, 762, 628), lambda x, y: d_ellipse(x, y, HX, HY, 252, 228), FUR_DARK)
-    head_paint((270, 184, 754, 620), lambda x, y: d_ellipse(x, y, HX, HY, 242, 218), FUR)
-    fur_shade(cv, (278, 192, 746, 612), HX, HY, 242, 218, head_fn)
+    # the head silhouette: a big oval plus fluff bumps on the cheeks
+    # and forehead, so the outline reads plush instead of machined
+    FLUFF = ((282, 500, 44), (742, 500, 44), (302, 566, 34), (722, 566, 34),
+             (440, 158, 41), (512, 146, 47), (584, 158, 41))
 
-    # tabby stripes on the forehead: three long, two short at the sides
+    def head_sdf(x, y):
+        d = dst_oval(x, y, HX, HY, 268, 238)
+        for (fx, fy, fr) in FLUFF:
+            di = dst_disc(x, y, fx, fy, fr)
+            if di < d:
+                d = di
+        return d
+    head_box = (228, 84, 796, 640)
+    head_shape(head_box, lambda x, y: head_sdf(x, y) + 7, FUR_LO)
+    head_shape(head_box, head_sdf, FUR)
+    # plush shading in head space, one pass: a warm light blooming
+    # from the upper left, else a soft rim following the fluff edge
+    def head_plush(x, y):
+        d = head_sdf(x, y)
+        if d >= 0.8:
+            return None
+        dl = DIST(x - (HX - 102), y - (HY - 110)) / 348.0
+        la = 0.32 * max(0.0, 1.0 - dl) ** 2
+        if la > 0.004:
+            return (FUR_HI, la)
+        if d >= -52.0:
+            ra = 0.15 * smooth(-52.0, 0.0, d)
+            if ra > 0.004:
+                return (FUR_TABBY, ra)
+        return None
+    head_shade(head_box, head_plush)
+
+    # tabby stripes: five across the forehead, two soft on each cheek
     for pts in (
-        [(452, 192), (448, 238), (452, 274)],
-        [(512, 182), (512, 230), (512, 268)],
-        [(572, 192), (576, 238), (572, 274)],
-        [(404, 210), (396, 244), (402, 268)],
-        [(620, 210), (628, 244), (622, 268)],
+        [(452, 168), (447, 214), (452, 252)],
+        [(512, 158), (512, 208), (512, 248)],
+        [(572, 168), (577, 214), (572, 252)],
+        [(402, 188), (393, 224), (400, 250)],
+        [(622, 188), (631, 224), (624, 250)],
     ):
-        head_paint(bbox_of(pts, 14), lambda x, y, p=pts: d_polyline(x, y, p) - 10, FUR_DEEP)
+        head_shape(bounds(pts, 15),
+                   lambda x, y, p=pts: dst_path(x, y, p) - 10, FUR_TABBY)
 
-    # muzzle patch
-    head_paint((356, 424, 668, 620), lambda x, y: d_ellipse(x, y, HX, 522, 148, 92), MUZZLE)
+    # muzzle: a small cream patch, low and centred
+    head_shape((372, 446, 652, 616),
+               lambda x, y: dst_oval(x, y, HX, 528, 134, 80), MUZZLE)
 
-    # ------------------------------------------------------------- eyes
-    # Enormous sparkling eyes, set low on the face (kitten proportions).
-    for ecx in (398, 626):
-        ebb = (ecx - 82, 330, ecx + 82, 530)
-        head_paint(ebb, lambda x, y, c=ecx: d_ellipse(x, y, c, 430, 70, 88), WHITE)
+    # --------------------------------------------------------------- eyes
+    # Enormous jewel eyes, low on the face. Iris: deep teal melting
+    # down into mint, a dark limbal ring for depth, an eyelid shadow
+    # across the top, triple sparkles and a tiny star.
+    for ecx in (390, 634):
+        ebox = (ecx - 86, 322, ecx + 86, 540)
+        head_shape(ebox, lambda x, y, c=ecx: dst_oval(x, y, c, 430, 76, 96),
+                   WHITE)
 
         def iris_fn(x, y, c=ecx):
-            d = d_ellipse(x, y, c, 434, 60, 78)
-            if d >= 0.75:
+            d = dst_oval(x, y, c, 434, 66, 86)
+            if d >= 0.8:
                 return None
-            t = clamp((y - 356) / 156.0, 0.0, 1.0)
+            t = clamp01((y - 348) / 172.0)
             if t < 0.5:
-                col = mix(IRIS_LT, IRIS_MID, t * 2.0)
+                col = blend(IRIS_TOP, IRIS_MID, t * 2.0)
             else:
-                col = mix(IRIS_MID, IRIS_DEEP, (t - 0.5) * 2.0)
-            return (col, cov(d))
-        head_fn(ebb, iris_fn)
-        # a soft glow crescent low in the iris, under the pupil
-        def glow_fn(x, y, c=ecx):
-            d = d_ellipse(x, y, c, 486, 34, 13)
-            if d >= 0.75:
-                return None
-            if d_ellipse(x, y, c, 434, 60, 78) >= 0.0:
-                return None
-            return (WHITE, 0.20 * cov(d))
-        head_fn(ebb, glow_fn)
-        # pupil
-        head_paint(ebb, lambda x, y, c=ecx: d_ellipse(x, y, c, 438, 28, 50), EYE_DARK)
-        # sparkles: one big, one small, one tiny
-        head_paint(ebb, lambda x, y, c=ecx: d_circle(x, y, c - 19, 402, 21), WHITE)
-        head_paint(ebb, lambda x, y, c=ecx: d_circle(x, y, c + 17, 464, 10), WHITE)
-        head_paint(ebb, lambda x, y, c=ecx: d_circle(x, y, c + 23, 390, 5), WHITE)
-        # soft dark lash arc over the eye
-        lash = arc_pts(ecx, 430, 70, math.radians(195), math.radians(345), 18)
-        lash = [(lx, 430 + (ly - 430) * 1.26) for (lx, ly) in lash]
-        head_paint(bbox_of(lash, 10), lambda x, y, p=lash: d_polyline(x, y, p) - 6, LINE)
+                col = blend(IRIS_MID, IRIS_LOW, (t - 0.5) * 2.0)
+            # dark limbal ring hugging the iris edge
+            ring = smooth(-13.0, -2.0, d)
+            col = blend(col, IRIS_RIM, 0.65 * ring)
+            # crescent of light pooled at the bottom of the iris
+            dl = DIST(x - c, y - 492) / 60.0
+            if dl < 1.0:
+                col = blend(col, WHITE, 0.16 * (1.0 - dl) ** 2)
+            return (col, cover(d))
+        head_shade(ebox, iris_fn)
 
-    # ------------------------------------------------------- nose + mouth
-    nose = [(484, 500), (540, 500), (512, 534)]
-    head_paint(bbox_of(nose, 6), lambda x, y: d_triangle(x, y, 484, 500, 540, 500, 512, 534), NOSE)
-    head_paint((486, 496, 512, 520), lambda x, y: d_circle(x, y, 498, 508, 7), (255, 205, 218))
-    # a small "w" smile under the nose
-    mouth_l = arc_pts(486, 528, 26, math.radians(15), math.radians(160), 12)
-    mouth_r = arc_pts(538, 528, 26, math.radians(20), math.radians(165), 12)
-    for pts in (mouth_l, mouth_r):
-        head_paint(bbox_of(pts, 8), lambda x, y, p=pts: d_polyline(x, y, p) - 5, LINE)
-    stem = [(512, 530), (512, 546)]
-    head_paint(bbox_of(stem, 8), lambda x, y: d_polyline(x, y, stem) - 5, LINE)
-    # tiny tongue peeking out under the smile, with a soft rim
-    head_paint((486, 550, 538, 594), lambda x, y: d_ellipse(x, y, 512, 573, 22, 17), (222, 90, 130))
-    head_paint((488, 552, 536, 592), lambda x, y: d_ellipse(x, y, 512, 572, 19, 14), PINK)
-    tline = [(512, 564), (512, 580)]
-    head_paint(bbox_of(tline, 5), lambda x, y: d_polyline(x, y, tline) - 2.2, (222, 90, 130))
+        def lid_fn(x, y, c=ecx):
+            d = dst_oval(x, y, c, 434, 66, 86)
+            if d >= 0.0:
+                return None
+            a = 0.20 * smooth(420.0, 356.0, y)
+            return (IRIS_RIM, a) if a > 0.004 else None
+        head_shade(ebox, lid_fn)
+        # pupil, tall and soft-edged
+        head_shape(ebox, lambda x, y, c=ecx: dst_oval(x, y, c, 440, 29, 53),
+                   PUPIL)
+        # sparkles: one big, one medium, one tiny, and a small star
+        head_shape(ebox, lambda x, y, c=ecx: dst_disc(x, y, c - 21, 398, 22),
+                   WHITE)
+        head_shape(ebox, lambda x, y, c=ecx: dst_disc(x, y, c + 18, 468, 11),
+                   WHITE)
+        head_shape(ebox, lambda x, y, c=ecx: dst_disc(x, y, c + 25, 388, 5.5),
+                   WHITE)
+        star = sparkle_pts(ecx - 24, 470, 10)
+        head_shape(bounds(star, 3),
+                   lambda x, y, p=star: dst_path(x, y, p + [p[0]]) - 1.4,
+                   WHITE)
+        # glossy lash line with a little wing at the outer corner
+        sgn = -1 if ecx < HX else 1
+        lash = arc(ecx, 428, 74, math.radians(192), math.radians(348), 20)
+        lash = [(lx, 428 + (ly - 428) * 1.30) for (lx, ly) in lash]
+        wing = [(ecx + sgn * 72, 372), (ecx + sgn * 88, 360)]
+        head_shape(bounds(lash, 11),
+                   lambda x, y, p=lash: dst_path(x, y, p) - 6.4, LINE)
+        head_shape(bounds(wing, 9),
+                   lambda x, y, p=wing: dst_path(x, y, p) - 5.0, LINE)
 
-    # ------------------------------------------------------------- blush
-    # soft rosy blush: a radial falloff spot low on each cheek,
-    # kept clear of the eyes and the whisker roots
-    for bcx in (352, 672):
+    # ------------------------------------------------------ nose + mouth
+    # a small heart-ish nose with a shine dot
+    nose = [(486, 494), (538, 494), (512, 526)]
+    head_shape(bounds(nose, 7), lambda x, y: dst_tri(x, y, *nose[0], *nose[1],
+                                                     *nose[2]), NOSE)
+    head_shape((488, 490, 514, 514), lambda x, y: dst_disc(x, y, 499, 502, 6.5),
+               (255, 208, 220))
+    # philtrum down to an open, happy little mouth with one fang
+    stem = [(512, 524), (512, 538)]
+    head_shape(bounds(stem, 7), lambda x, y: dst_path(x, y, stem) - 4.4, LINE)
+    head_shape((482, 530, 542, 582),
+               lambda x, y: dst_oval(x, y, 512, 556, 23, 19), MOUTH_IN)
+    head_shape((488, 548, 536, 580),
+               lambda x, y: dst_oval(x, y, 512, 565, 16, 11), TONGUE)
+    fang = [(492, 540), (504, 540), (497, 554)]
+    head_shape(bounds(fang, 4), lambda x, y: dst_tri(x, y, *fang[0], *fang[1],
+                                                     *fang[2]), WHITE)
+
+    # -------------------------------------------------------------- blush
+    # big soft blush low on both cheeks, with tiny anime cheek marks
+    for bcx in (322, 702):
         def blush_fn(x, y, c=bcx):
-            u = ((x - c) / 40.0) ** 2 + ((y - 516) / 23.0) ** 2
+            u = ((x - c) / 56.0) ** 2 + ((y - 522) / 30.0) ** 2
             if u >= 1.0:
                 return None
-            return (BLUSH, 0.45 * (1.0 - u) ** 1.5)
-        head_fn((bcx - 58, 480, bcx + 58, 552), blush_fn)
+            return (BLUSH, 0.48 * (1.0 - u) ** 1.5)
+        head_shade((bcx - 74, 480, bcx + 74, 564), blush_fn)
+        for k in range(3):
+            mx = bcx - 18 + 18 * k
+            mark = [(mx - 7, 540 + (k % 2) * 5), (mx + 7, 532 + (k % 2) * 5)]
+            head_shape(bounds(mark, 6),
+                       lambda x, y, p=mark: dst_path(x, y, p) - 2.4,
+                       (252, 178, 186))
 
-    # ---------------------------------------------------------- whiskers
-    # three per side, gently curved and tapered, fanning from the muzzle
+    # ----------------------------------------------------------- whiskers
+    # three a side, fine and long, fanning low from the muzzle
     for sgn in (-1, 1):
-        for (wy, drop) in ((494, -4), (520, 12), (546, 30)):
-            pts = quad_pts((HX + sgn * 98, wy), (HX + sgn * 196, wy + drop * 0.3),
-                           (HX + sgn * 292, wy + drop), 20)
-            tapered_line(head_paint, pts, WHISKER, 3.2)
+        for (wy, drop) in ((492, -2), (519, 15), (546, 34)):
+            pts = quad((HX + sgn * 104, wy), (HX + sgn * 204, wy + drop * 0.3),
+                       (HX + sgn * 298, wy + drop), 22)
+            taper_stroke(head_shape, pts, WHISK, 2.6)
+
+    # -------------------------------------------------------- raised paw
+    # the waving paw, drawn over the cheek fluff on the viewer's
+    # left: a plump arm rising from the body, beans to the viewer
+    arm = cubic((348, 722), (292, 648), (252, 580), (238, 540), 22)
+    pic.shape(bounds(arm, 52), lambda x, y: dst_path(x, y, arm) - 40, FUR_LO)
+    pic.shape(bounds(arm, 52), lambda x, y: dst_path(x, y, arm) - 33, FUR)
+    PAW = (232, 478)
+    paw_rot = -0.25
+    ca, sa = math.cos(paw_rot), math.sin(paw_rot)
+
+    def paw_local(x, y):
+        dx, dy = x - PAW[0], y - PAW[1]
+        return (PAW[0] + dx * ca + dy * sa, PAW[1] - dx * sa + dy * ca)
+
+    def paw_sdf(x, y):
+        lx, ly = paw_local(x, y)
+        return dst_oval(lx, ly, PAW[0], PAW[1], 47, 57)
+    paw_box = (PAW[0] - 80, PAW[1] - 86, PAW[0] + 80, PAW[1] + 86)
+    pic.shape(paw_box, lambda x, y: paw_sdf(x, y) + 6, FUR_LO)
+    pic.shape(paw_box, paw_sdf, FUR)
+    glow_spot(pic, paw_box, PAW[0] - 12, PAW[1] - 18, 40, 48, FUR_HI, 0.30)
+    # beans: three toes in an arc over one big heel pad
+    for (tx, ty, tr) in ((-24, -22, 10.5), (0, -30, 11.5), (24, -22, 10.5),
+                         (0, 13, 21)):
+        def bean_sdf(x, y, a=tx, b=ty, r=tr):
+            lx, ly = paw_local(x, y)
+            return dst_oval(lx, ly, PAW[0] + a, PAW[1] + b, r, r * 0.86)
+        pic.shape(paw_box, bean_sdf, ROSE_SOFT)
+    # little toe separation ticks above the beans
+    for sgn2 in (-1, 1):
+        def tick_sdf(x, y, s2=sgn2):
+            lx, ly = paw_local(x, y)
+            return dst_seg(lx, ly, PAW[0] + s2 * 13, PAW[1] - 44,
+                           PAW[0] + s2 * 15, PAW[1] - 34) - 2.0
+        pic.shape(paw_box, tick_sdf, FUR_LO)
 
     # ---------------------------------------------------------------- bow
-    # a pink bow perched by the cat's right ear (viewer's right)
-    bx, by = 678, 156
-    BC, BS = math.cos(0.35), math.sin(0.35)
+    # a two-layer bow with ribbon tails, perched by the right ear
+    bx, by = 700, 138
+    BA = 0.32
+    BC, BS = math.cos(BA), math.sin(BA)
 
-    def bow_paint(bbox, fn, color):
+    def bow_shape(bbox, sdf, rgb):
         def wrapped(x, y):
             dx, dy = x - bx, y - by
-            return fn(bx + dx * BC + dy * BS, by - dx * BS + dy * BC)
-        cv.paint(bbox, wrapped, color)
+            return sdf(bx + dx * BC + dy * BS, by - dx * BS + dy * BC)
+        pic.shape(bbox, wrapped, rgb)
+    bow_box = (bx - 150, by - 120, bx + 150, by + 150)
+    # tails first, hanging below the loops: filled ribbon strips
+    for sgn in (-1, 1):
+        t1 = [(bx + sgn * 6, by + 12), (bx + sgn * 58, by + 28),
+              (bx + sgn * 46, by + 92)]
+        t2 = [(bx + sgn * 6, by + 12), (bx + sgn * 46, by + 92),
+              (bx + sgn * 10, by + 76)]
+        for t in (t1, t2):
+            bow_shape(bow_box, lambda x, y, tt=t:
+                      dst_tri(x, y, *tt[0], *tt[1], *tt[2]), BOW_LO)
+        for t in (t1, t2):
+            bow_shape(bow_box, lambda x, y, tt=scaled(t, bx, by + 14, 0.78):
+                      dst_tri(x, y, *tt[0], *tt[1], *tt[2]), BOW)
+    for sgn in (-1, 1):
+        loop = [(bx, by), (bx + sgn * 96, by - 48), (bx + sgn * 92, by + 50)]
+        bow_shape(bow_box, lambda x, y, t=loop:
+                  dst_tri(x, y, *t[0], *t[1], *t[2]), BOW_LO)
+        bow_shape(bow_box, lambda x, y, t=scaled(loop, bx, by, 0.86):
+                  dst_tri(x, y, *t[0], *t[1], *t[2]), BOW)
+        inner = [(bx + sgn * 16, by), (bx + sgn * 66, by - 26),
+                 (bx + sgn * 62, by + 28)]
+        bow_shape(bow_box, lambda x, y, t=inner:
+                  dst_tri(x, y, *t[0], *t[1], *t[2]), BOW_HI)
+    bow_shape(bow_box, lambda x, y: dst_disc(x, y, bx, by, 25), BOW_LO)
+    bow_shape(bow_box, lambda x, y: dst_disc(x, y, bx, by, 19), BOW)
+    bow_shape(bow_box, lambda x, y: dst_disc(x, y, bx - 6, by - 6, 6.5),
+              ROSE_SOFT)
 
-    BOW_BB = (bx - 130, by - 100, bx + 130, by + 100)
-    bow_paint(BOW_BB, lambda x, y: d_triangle(x, y, bx, by, bx - 88, by - 44, bx - 84, by + 48), BOW_DARK)
-    bow_paint(BOW_BB, lambda x, y: d_triangle(x, y, bx, by, bx + 88, by - 44, bx + 84, by + 48), BOW_DARK)
-    bow_paint(BOW_BB, lambda x, y: d_triangle(x, y, bx, by, bx - 78, by - 36, bx - 74, by + 40), BOW)
-    bow_paint(BOW_BB, lambda x, y: d_triangle(x, y, bx, by, bx + 78, by - 36, bx + 74, by + 40), BOW)
-    bow_paint(BOW_BB, lambda x, y: d_circle(x, y, bx, by, 24), BOW_DARK)
-    bow_paint(BOW_BB, lambda x, y: d_circle(x, y, bx, by, 18), BOW)
-    bow_paint(BOW_BB, lambda x, y: d_circle(x, y, bx - 6, by - 6, 6), PINK_SOFT)
-
-    # ------------------------------------------- tiny floating hearts
-    def heart(cx, cy, s, color, alpha):
+    # ------------------------------------------------------ floating hearts
+    def heart(cx, cy, s, rgb, alpha):
         def fn(x, y):
             lx = (x - cx) / s
             ly = (cy - y) / s
             v = (lx * lx + ly * ly - 1) ** 3 - lx * lx * ly ** 3
-            return (color, alpha) if v < 0 else None
+            return (rgb, alpha) if v < 0 else None
         pad = int(s * 1.5)
-        cv.paint_fn((cx - pad, cy - pad, cx + pad, cy + pad), fn)
-    heart(168, 268, 26, PINK, 0.75)
-    heart(864, 330, 19, PINK, 0.6)
-    heart(852, 236, 13, PINK, 0.5)
+        pic.shade((cx - pad, cy - pad, cx + pad, cy + pad), fn)
+    heart(158, 262, 28, ROSE, 0.78)
+    heart(880, 452, 20, ROSE, 0.62)
+    heart(866, 190, 14, ROSE, 0.52)
+    heart(104, 402, 13, ROSE, 0.5)
 
-    return cv
+    return pic
 
 
-# ------------------------------------------------------------------- PNG
+# --------------------------------------------------------------------- PNG
 
-def write_png(cv, path):
-    w, h = cv.w, cv.h
+def encode_png(pic):
+    s = pic.size
+    stride = s * 3
     raw = bytearray()
-    rowlen = w * 3
-    for y in range(h):
-        raw.append(0)  # filter: none
-        raw += cv.px[y * rowlen:(y + 1) * rowlen]
+    for y in range(s):
+        raw.append(0)
+        raw += pic.buf[y * stride:(y + 1) * stride]
 
     def chunk(tag, data):
-        c = struct.pack(">I", len(data)) + tag + data
-        c += struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
-        return c
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
 
-    png = bytearray(b"\x89PNG\r\n\x1a\n")
-    png += chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
-    png += chunk(b"IDAT", zlib.compress(bytes(raw), 9))
-    png += chunk(b"IEND", b"")
-    with open(path, "wb") as f:
-        f.write(png)
+    out = bytearray(b"\x89PNG\r\n\x1a\n")
+    out += chunk(b"IHDR", struct.pack(">IIBBBBB", s, s, 8, 2, 0, 0, 0))
+    out += chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+    out += chunk(b"IEND", b"")
+    return bytes(out)
 
 
 def main():
     out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
     os.makedirs(out_dir, exist_ok=True)
-    cv = draw()
-    write_png(cv, os.path.join(out_dir, "entry.png"))
+    data = encode_png(draw())
+    with open(os.path.join(out_dir, "entry.png"), "wb") as fh:
+        fh.write(data)
 
 
 if __name__ == "__main__":
